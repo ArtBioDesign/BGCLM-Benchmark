@@ -1,6 +1,7 @@
 import torch
 import os
-from typing import List
+import numpy as np
+from typing import List, Dict
 
 # Fix imports - use proper Hugging Face imports
 from transformers import (
@@ -14,16 +15,39 @@ from model import DNATokenizer, DNADataset, MegaDNAConfig, MegaDNACausalLM
 from utils import split_dataset, load_dna_sequences
 
 
+def load_presplit_data(data_dir: str) -> Dict[str, List[str]]:
+    """
+    Load pre-split train/validation/test data from npy files.
+    
+    Args:
+        data_dir: Directory containing train_sequences.npy, 
+                  validation_sequences.npy, test_sequences.npy
+    
+    Returns:
+        Dictionary with 'train', 'validation', 'test' keys containing lists of DNA sequences
+    """
+    splits = {}
+    
+    for split_name in ['train', 'validation', 'test']:
+        npy_path = os.path.join(data_dir, f'{split_name}_sequences.npy')
+        if os.path.exists(npy_path):
+            sequences = np.load(npy_path, allow_pickle=True)
+            splits[split_name] = sequences.tolist()
+            print(f"Loaded {len(splits[split_name])} {split_name} sequences from {npy_path}")
+        else:
+            splits[split_name] = []
+            print(f"Warning: {npy_path} not found, using empty {split_name} set")
+    
+    return splits
 
-# Enhanced incremental pretraining setup with dataset splitting
+
+
+# Enhanced incremental pretraining setup with pre-split datasets
 def setup_incremental_pretraining(
     model_path: str,
     tokenizer_path: str,
-    training_data: List[str],
+    dataset_splits: Dict[str, List[str]],  # Changed from training_data to pre-split data
     output_dir: str,
-    test_size: float = 0.1,
-    val_size: float = 0.1,
-    random_state: int = 42,
     learning_rate: float = 5e-5,
     train_batch_size: int = 4,
     eval_batch_size: int = 8,
@@ -34,10 +58,18 @@ def setup_incremental_pretraining(
     logging_steps: int = 100,
     save_steps: int = 500,
     eval_steps: int = 500,
+    resume_from_checkpoint: str = None,
     **kwargs
 ):
     """
-    Set up and run incremental pretraining for MegaDNA model with proper dataset splitting
+    Set up and run incremental pretraining for MegaDNA model using pre-split datasets.
+    
+    Args:
+        model_path: Path to pretrained model
+        tokenizer_path: Path to tokenizer
+        dataset_splits: Dictionary with 'train', 'validation', 'test' keys containing lists of DNA sequences
+        output_dir: Output directory for trained model
+        ... other training parameters
     """
     
     # Load tokenizer
@@ -47,14 +79,6 @@ def setup_incremental_pretraining(
         # Create default tokenizer if path doesn't exist
         tokenizer = DNATokenizer()
         print(f"Tokenizer path {tokenizer_path} not found. Using default tokenizer.")
-    
-    # Split dataset
-    dataset_splits = split_dataset(
-        training_data, 
-        test_size=test_size, 
-        val_size=val_size, 
-        random_state=random_state
-    )
     
     # Create datasets
     train_dataset = DNADataset(
@@ -104,7 +128,7 @@ def setup_incremental_pretraining(
     # Define training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
-        overwrite_output_dir=True,
+        overwrite_output_dir=False,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=eval_batch_size,
@@ -129,10 +153,17 @@ def setup_incremental_pretraining(
     # Define compute metrics function
     def compute_metrics(eval_preds):
         logits, labels = eval_preds
+        
+        # Handle cases where logits might be CausalLMOutput or tuple
+        if hasattr(logits, 'logits'):
+            logits = logits.logits
+        elif isinstance(logits, (list, tuple)) and len(logits) > 0:
+            logits = logits[0]
+            
         # Calculate perplexity as metric
         loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100) #tokenizer.pad_token_id
-        logits_tensor = torch.tensor(logits)
-        labels_tensor = torch.tensor(labels)
+        logits_tensor = torch.tensor(logits) if not isinstance(logits, torch.Tensor) else logits
+        labels_tensor = torch.tensor(labels) if not isinstance(labels, torch.Tensor) else labels
         
         # Shift logits and labels for causal LM
         shift_logits = logits_tensor[..., :-1, :].contiguous()
@@ -156,7 +187,7 @@ def setup_incremental_pretraining(
         data_collator=data_collator,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=10)]
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
     
     # Start training
@@ -164,7 +195,7 @@ def setup_incremental_pretraining(
     print(f"Training on {len(train_dataset)} examples")
     print(f"Validating on {len(val_dataset)} examples")
     
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     
     # Save final model
     final_output_dir = os.path.join(output_dir, "final_model")
@@ -196,54 +227,54 @@ def setup_incremental_pretraining(
     return model, tokenizer, trainer
 
 
-# Example usage with proper dataset splitting
+# Example usage with pre-split dataset
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Incremental Pretraining for MegaDNA')
-    parser.add_argument('--model_path', type=str, default="",   #/hpcfs/fhome/yangchh/genome_lms/megaDNA/model/megaDNA_phage_145M.pt
+    parser.add_argument('--model_path', type=str, default="",
                       help='Path to pretrained model')
-    parser.add_argument('--tokenizer_path', type=str, default="/hpcfs/fhome/yangchh/genome_lms/MEGABYTE-pytorch/dataset/vocab.json",
+    parser.add_argument('--tokenizer_path', type=str, default="/hpcfs/fhome/yangchh/BGC-SM/BGCLM-Benchmark/megaBGC/vocab.json",
                       help='Path to tokenizer')
-    parser.add_argument('--data_file', type=str, default="/hpcfs/fhome/yangchh/genome_lms/megaDNA/data/filtered_65536_clean.fasta",
-                      help='Path to DNA sequences file (FASTA or plain text)')
+    parser.add_argument('--data_dir', type=str, 
+                      default="/hpcfs/fhome/yangchh/BGC-SM/BGCLM-Benchmark/data/BGC",
+                      help='Directory containing pre-split train/validation/test .npy files')
     parser.add_argument('--output_dir', type=str, default="./pretraining",
                       help='Output directory for trained model')
-    parser.add_argument('--max_sequences', type=int, default=20203,
-                      help='Maximum number of sequences to use')
-    parser.add_argument('--max_seq_length', type=int, default=65536, #8192
+    parser.add_argument('--max_seq_length', type=int, default=65536,
                       help='Maximum sequence length')
     parser.add_argument('--train_batch_size', type=int, default=1,
                       help='Training batch size')
     parser.add_argument('--eval_batch_size', type=int, default=1,
                       help='Evaluation batch size')
-    parser.add_argument('--num_epochs', type=int, default=10000000,
+    parser.add_argument('--num_epochs', type=int, default=10000,
                       help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=2e-5,
                       help='Learning rate')
-    parser.add_argument('--test_size', type=float, default=0.01,
-                      help='Test set proportion')
-    parser.add_argument('--val_size', type=float, default=0.1,
-                      help='Validation set proportion')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                       help='Device to use')
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None,
+                      help='Path to checkpoint to resume training from')
     
     args = parser.parse_args()
     
-    # Load DNA sequences
-    dna_sequences = load_dna_sequences(args.data_file, max_sequences=args.max_sequences)
+    # Load pre-split DNA sequences
+    dataset_splits = load_presplit_data(args.data_dir)
     
-    if len(dna_sequences) < 10:
-        raise ValueError("Not enough valid DNA sequences found. Please check your input file.")
+    if len(dataset_splits['train']) < 10:
+        raise ValueError("Not enough valid training DNA sequences found. Please check your data directory.")
     
-    # Run incremental pretraining with dataset splitting
+    print(f"\nDataset summary:")
+    print(f"  Training: {len(dataset_splits['train'])} sequences")
+    print(f"  Validation: {len(dataset_splits['validation'])} sequences")
+    print(f"  Test: {len(dataset_splits['test'])} sequences")
+    
+    # Run incremental pretraining with pre-split data
     model, tokenizer, trainer = setup_incremental_pretraining(
         model_path=args.model_path,
         tokenizer_path=args.tokenizer_path,
-        training_data=dna_sequences,
+        dataset_splits=dataset_splits,
         output_dir=args.output_dir,
-        test_size=args.test_size,
-        val_size=args.val_size,
         learning_rate=args.learning_rate,
         train_batch_size=args.train_batch_size,
         eval_batch_size=args.eval_batch_size,
@@ -254,6 +285,7 @@ if __name__ == "__main__":
         logging_steps=50,
         save_steps=200,
         eval_steps=200,
+        resume_from_checkpoint=args.resume_from_checkpoint,
         seed=42
     )
     

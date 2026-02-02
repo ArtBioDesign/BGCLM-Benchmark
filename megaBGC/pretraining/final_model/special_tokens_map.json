@@ -1,0 +1,4 @@
+{
+  "eos_token": "#",
+  "pad_token": "**"
+}

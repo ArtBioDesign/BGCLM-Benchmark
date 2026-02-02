@@ -1,5 +1,3 @@
-
-
 from transformers import (
     PreTrainedModel, 
     PreTrainedTokenizer
@@ -20,7 +18,6 @@ from beartype import beartype
 from beartype.typing import Tuple, Union
 from tqdm import tqdm
 from typing import List, Type, Optional, Dict, Any
-
 
 class MEGADNA(MEGABYTE):
 
@@ -51,19 +48,34 @@ class MEGADNA(MEGABYTE):
             **kwargs
         )
 
-    def generate(self, prime = None, seq_len = 1024, filter_thres = 0.9, temperature = 1., default_batch_size = 1):
+    def generate(self, prime = None, seq_len = 1024, filter_thres = 0.9, temperature = 1., default_batch_size = 1, eos_token_id = None):
         device = next(self.parameters()).device
 
         seq = prime if exists(prime) else torch.empty((default_batch_size, 0), dtype = torch.long, device = device)
         batch = seq.shape[0]
+        finished = None
+        if eos_token_id is not None:
+            finished = torch.zeros((batch,), dtype = torch.bool, device = device)
+            if seq.numel() > 0:
+                finished = (seq == eos_token_id).any(dim = -1)
         
         with torch.no_grad():
             for _ in tqdm(range(seq_len - seq.shape[-1])):
                 logits = self.forward(seq, return_value='logits')[:, -1]
                 logits = top_k(logits, thres = filter_thres)
                 sampled = gumbel_sample(logits, dim = -1, temperature = temperature)
+                if eos_token_id is not None:
+                    sampled = torch.where(
+                        finished,
+                        torch.full_like(sampled, eos_token_id),
+                        sampled
+                    )
                 seq = torch.cat((seq, rearrange(sampled, 'b -> b 1')), dim = -1)
                 del logits, sampled
+                if eos_token_id is not None:
+                    finished = finished | (seq[:, -1] == eos_token_id)
+                    if torch.all(finished):
+                        break
 
         return seq.reshape(batch, -1)
 
@@ -135,13 +147,13 @@ class MEGADNA(MEGABYTE):
             attended = unpack_one(attended, ps, '* n d')
             prev_stage_tokens_repr = proj(attended[..., :-1, :])
 
-        if return_value == 'embedding':
-            return hidden_states
+        # if return_value == 'embedding':
+        #     return hidden_states
             
         logits = self.to_logits(attended)
-        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
-        start_tokens = rearrange(start_tokens, 'b d -> b 1 d')
-        logits = logits[..., 1:, :]
+        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]   #序列最开始那个位置的logits
+        start_tokens = rearrange(start_tokens, 'b d -> b 1 d')   #将start_tokens的维度从(b,d)变成(b,1,d)
+        logits = logits[..., 1:, :]     #去掉序列最开始那个位置的logits
 
         if return_value == 'logits':
             if flattened_dims:
@@ -149,19 +161,19 @@ class MEGADNA(MEGABYTE):
                 logits = logits[:, :seq_len]
             return logits
             
-        logits = rearrange(logits, 'b ... c -> b (...) c')
-        logits = torch.cat((start_tokens, logits), dim = -2)
+        logits = rearrange(logits, 'b ... c -> b (...) c')      #将logits的维度从(b,...,c)变成(b,...,c)
+        logits = torch.cat((start_tokens, logits), dim = -2)    #将start_tokens和logits拼接在一起
 
         # For Hugging Face compatibility, handle labels if provided
         loss = None
         if labels is not None:
-            preds = rearrange(logits, 'b n c -> b c n')
-            labels = rearrange(labels, 'b ... -> b (...)')
+            preds = rearrange(logits, 'b n c -> b c n')     #将logits的维度从(b,...,c)变成(b,c,...)
+            labels = rearrange(labels, 'b ... -> b (...)')   #将labels的维度从(b,...)变成(b,...)
             
             loss = F.cross_entropy(
                 preds[..., :-1],
                 labels,
-                ignore_index = -100
+                ignore_index = -100   # 0
             )
 
         return CausalLMOutput(
@@ -202,11 +214,38 @@ class DNATokenizer(PreTrainedTokenizer):
         eos_token=DEFAULT_TOKENS[1],
         **kwargs,
     ):
-        self.vocab = [pad_token, "A", "T", "C", "G", eos_token]
+        vocab = None
+        if vocab_file and os.path.isfile(vocab_file):
+            if str(vocab_file).endswith(".json"):
+                import json
+                with open(vocab_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    max_id = max(int(v) for v in data.values())
+                    vocab = [None] * (max_id + 1)
+                    for tok, idx in data.items():
+                        vocab[int(idx)] = tok
+                    if any(tok is None for tok in vocab):
+                        vocab = [tok for tok, _ in sorted(data.items(), key=lambda kv: kv[1])]
+                elif isinstance(data, list):
+                    vocab = [str(tok) for tok in data]
+            else:
+                with open(vocab_file, "r", encoding="utf-8") as f:
+                    vocab = [line.strip() for line in f if line.strip()]
+
+        if not vocab:
+            vocab = [pad_token, "A", "T", "C", "G", eos_token]
+
+        if pad_token not in vocab and "**" in vocab:
+            pad_token = "**"
+        if eos_token not in vocab and "#" in vocab:
+            eos_token = "#"
+
+        self.vocab = vocab
         self.token_to_id = {tok: idx for idx, tok in enumerate(self.vocab)}
         self.id_to_token = {idx: tok for idx, tok in enumerate(self.vocab)}
-        self.pad_token_id = 0
-        self.eos_token_id = 5
+        self.pad_token_id = self.token_to_id.get(pad_token, 0)
+        self.eos_token_id = self.token_to_id.get(eos_token, len(self.vocab) - 1)
 
 
 
@@ -313,8 +352,8 @@ class MegaDNACausalLM(MegaDNAPreTrainedModel):
         
         return CausalLMOutput(
             loss=outputs.loss if return_value=="loss" else None,
-            logits=outputs.logits if return_value=="loss" else None,
-            hidden_states=outputs,
+            logits=outputs.logits if return_value in ["loss", "logits"] else None,
+            hidden_states=outputs.hidden_states if return_value=="embedding" else None,
             attentions=None
         )
 
@@ -324,6 +363,7 @@ class MegaDNACausalLM(MegaDNAPreTrainedModel):
         max_length: int = 8192,
         temperature: float = 0.95,
         filter_thres: float = 0,
+        eos_token_id: Optional[int] = None,
         **kwargs
     ):
         return self.megadna.generate(
@@ -331,10 +371,10 @@ class MegaDNACausalLM(MegaDNAPreTrainedModel):
             seq_len=max_length,
             temperature=temperature,
             filter_thres=filter_thres,
+            eos_token_id=eos_token_id,
             default_batch_size= 1                       
         )
-    
-# Enhanced Dataset class with train/val split capability
+
 class DNADataset(Dataset):
     def __init__(self, sequences, tokenizer, max_length=1024, is_training=True):
         self.sequences = sequences
@@ -358,12 +398,10 @@ class DNADataset(Dataset):
             if char in self.tokenizer.token_to_id:
                 input_ids.append(self.tokenizer.token_to_id[char])
         
-        # Pad to max_length
-        if len(input_ids) < self.max_length-1:
-            input_ids += [self.tokenizer.pad_token_id] * (self.max_length - 1 - len(input_ids))
-            input_ids.append(self.tokenizer.eos_token_id)
-        else:
-            input_ids.append(self.tokenizer.eos_token_id)
+        # Append eos at the true end, then pad to max_length
+        input_ids.append(self.tokenizer.eos_token_id)
+        if len(input_ids) < self.max_length:
+            input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()  # For causal LM, labels are same as input_ids
@@ -373,3 +411,4 @@ class DNADataset(Dataset):
             'labels': labels,
             'attention_mask': (input_ids != self.tokenizer.pad_token_id).long()
         }
+        
